@@ -11,6 +11,7 @@ on:
       - README.md
       - pyproject.toml
       - src/**
+      - tests/**
       - .github/workflows/container.yml
   workflow_dispatch:
 
@@ -19,7 +20,25 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install package
+        run: python -m pip install .
+
+      - name: Test SSH session lifecycle
+        run: python -m unittest discover -s tests -v
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

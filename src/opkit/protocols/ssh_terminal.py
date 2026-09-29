@@ -482,6 +482,9 @@ class SSHTerminalManager:
 
     def __init__(self) -> None:
         self._sessions: dict[str, SSHTerminalSession] = {}
+        self._opening: dict[
+            str, asyncio.Task[tuple[SSHTerminalSession, ReadResult]]
+        ] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
 
@@ -502,57 +505,81 @@ class SSHTerminalManager:
         deadline_ms: int | None = None,
         response_limit_bytes: int | None = None,
     ) -> tuple[SSHTerminalSession, ReadResult]:
-        self._protocol_of(config, device_name)
+        protocol = self._protocol_of(config, device_name)
 
         async with self._lock:
-            existing = self._sessions.get(device_name)
-            if existing is not None and existing.connected:
-                session = existing
-                reuse_existing = True
-                stale = None
+            session = self._sessions.get(device_name)
+            if session is not None and session.connected:
+                opening = None
             else:
-                reuse_existing = False
-                stale = existing
-            if existing is not None:
-                if not reuse_existing:
-                    self._sessions.pop(device_name, None)
-            if not reuse_existing:
-                if len(self._sessions) >= MAX_SESSIONS:
-                    raise ProtocolError("maximum number of SSH terminals reached")
-                session = SSHTerminalSession(
-                    device_name,
-                    self._protocol_of(config, device_name),
-                )
-                self._sessions[device_name] = session
+                opening = self._opening.get(device_name)
+                if opening is None:
+                    stale = session
+                    occupied = self._sessions.keys() | self._opening.keys()
+                    if device_name not in occupied and len(occupied) >= MAX_SESSIONS:
+                        raise ProtocolError("maximum number of SSH terminals reached")
+                    opening = asyncio.create_task(
+                        self._open_session(
+                            device_name, protocol, stale,
+                            quiet_timeout_ms=quiet_timeout_ms,
+                            deadline_ms=deadline_ms,
+                            response_limit_bytes=response_limit_bytes,
+                        ),
+                        name=f"opkit-ssh-open-{device_name}",
+                    )
+                    self._opening[device_name] = opening
+                    # A cancelled caller must not cancel another caller's open.
+                    opening.add_done_callback(self._observe_open_result)
 
-        if stale is not None:
-            await stale.close()
+        if opening is not None:
+            return await asyncio.shield(opening)
 
-        if reuse_existing:
-            initial = await session.read(
-                0,
-                quiet_timeout_ms=quiet_timeout_ms,
-                deadline_ms=deadline_ms,
-                response_limit_bytes=response_limit_bytes,
-            )
-            return session, initial
-
-        try:
-            await session.connect()
-            initial = await session.read(
-                0,
-                quiet_timeout_ms=quiet_timeout_ms,
-                deadline_ms=deadline_ms,
-                response_limit_bytes=response_limit_bytes,
-            )
-        except Exception:
-            await session.close()
-            async with self._lock:
-                self._sessions.pop(device_name, None)
-            raise
-
-        self._ensure_reaper()
+        initial = await session.read(
+            0,
+            quiet_timeout_ms=quiet_timeout_ms,
+            deadline_ms=deadline_ms,
+            response_limit_bytes=response_limit_bytes,
+        )
         return session, initial
+
+    @staticmethod
+    def _observe_open_result(task: asyncio.Task[Any]) -> None:
+        # Retrieve failures even if every waiting caller has been cancelled.
+        if not task.cancelled():
+            task.exception()
+
+    async def _open_session(
+        self,
+        device_name: str,
+        protocol: SSHTerminalProtocol,
+        stale: SSHTerminalSession | None,
+        **read_options: Any,
+    ) -> tuple[SSHTerminalSession, ReadResult]:
+        session = SSHTerminalSession(device_name, protocol)
+        try:
+            if stale is not None:
+                await stale.close()
+                async with self._lock:
+                    if self._sessions.get(device_name) is stale:
+                        self._sessions.pop(device_name)
+            await session.connect()
+            initial = await session.read(0, **read_options)
+            async with self._lock:
+                # close()/close_all() may have detached this pending open.
+                if self._opening.get(device_name) is not asyncio.current_task():
+                    raise asyncio.CancelledError
+                self._sessions[device_name] = session
+                self._opening.pop(device_name)
+                self._ensure_reaper()
+            return session, initial
+        except BaseException:
+            # Cancellation must release the connection and transcript too.
+            await session.close()
+            raise
+        finally:
+            async with self._lock:
+                if self._opening.get(device_name) is asyncio.current_task():
+                    self._opening.pop(device_name)
 
     async def get(self, device_name: str) -> SSHTerminalSession:
         async with self._lock:
@@ -571,27 +598,39 @@ class SSHTerminalManager:
     async def occupied(self, device_name: str) -> bool:
         async with self._lock:
             session = self._sessions.get(device_name)
-        return session is not None and session.connected
+            opening = device_name in self._opening
+        return opening or (session is not None and session.connected)
 
     async def close(self, device_name: str) -> None:
         async with self._lock:
-            session = self._sessions.get(device_name)
-        if session is None:
+            session = self._sessions.pop(device_name, None)
+            opening = self._opening.pop(device_name, None)
+        if session is None and opening is None:
             raise ProtocolError(f"no open terminal for device: {device_name}")
-        await session.close()
-        async with self._lock:
-            self._sessions.pop(device_name, None)
+        if opening is not None:
+            opening.cancel()
+            await asyncio.gather(opening, return_exceptions=True)
+        if session is not None:
+            await session.close()
 
     async def close_all(self) -> int:
         async with self._lock:
+            count = len(self._sessions.keys() | self._opening.keys())
             sessions = list(self._sessions.values())
+            opening = list(self._opening.values())
             self._sessions.clear()
+            self._opening.clear()
+            reaper = self._reaper_task
+            self._reaper_task = None
+        if reaper is not None:
+            reaper.cancel()
+            await asyncio.gather(reaper, return_exceptions=True)
+        for task in opening:
+            task.cancel()
+        await asyncio.gather(*opening, return_exceptions=True)
         for session in sessions:
             await session.close()
-        if self._reaper_task is not None:
-            self._reaper_task.cancel()
-            self._reaper_task = None
-        return len(sessions)
+        return count
 
     def _ensure_reaper(self) -> None:
         if self._reaper_task is None:
@@ -612,4 +651,5 @@ class SSHTerminalManager:
             for session in expired:
                 await session.close()
                 async with self._lock:
-                    self._sessions.pop(session.device_name, None)
+                    if self._sessions.get(session.device_name) is session:
+                        self._sessions.pop(session.device_name)
